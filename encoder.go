@@ -15,6 +15,7 @@ import (
 // Encoder implements an encoder for an LTX file.
 type Encoder struct {
 	w     io.Writer      // main writer
+	zw    *zstd.Encoder  // compressed writer
 	state string
 
 	header  Header
@@ -31,11 +32,21 @@ type Encoder struct {
 
 // NewEncoder returns a new instance of Encoder.
 func NewEncoder(w io.Writer) (*Encoder, error) {
-	return &Encoder{
+	enc := &Encoder{
 		w:     w,
 		state: stateHeader,
 		index: make(map[uint32]PageIndexElem),
-	}, nil
+	}
+
+	// The compressed writer writes to a buffer so we can calculate the size
+	// of the compressed data for the page index.
+	zw, err := zstd.NewWriter(&enc.buf, zstd.WithEncoderLevel(zstd.SpeedDefault))
+	if err != nil {
+		return nil, fmt.Errorf("cannot create zstd writer: %w", err)
+	}
+	enc.zw = zw
+
+	return enc, nil
 }
 
 // N returns the number of bytes written.
@@ -76,6 +87,11 @@ func (enc *Encoder) Close() error {
 		return fmt.Errorf("marshal empty page header: %w", err)
 	} else if _, err := enc.write(b0); err != nil {
 		return fmt.Errorf("write empty page header: %w", err)
+	}
+
+	// Close the compressed writer.
+	if err := enc.zw.Close(); err != nil {
+		return fmt.Errorf("cannot close zstd writer: %w", err)
 	}
 
 	// Write index to file.
@@ -257,27 +273,18 @@ func (enc *Encoder) write(b []byte) (n int, err error) {
 // write to the compressed writer & add to the checksum.
 // Returns the size of the compressed data.
 func (enc *Encoder) writeCompressed(b []byte) (n int, err error) {
-	// Reset the buffer.
+	// Reset the buffer & compressed writer.
 	enc.buf.Reset()
+	enc.zw.Reset(&enc.buf)
 
-	// Create a new zstd writer for each page to ensure each page is a complete frame.
-	// Set the content size so the decoder knows how much data to expect without buffering ahead
-	zw, err := zstd.NewWriter(&enc.buf,
-		zstd.WithEncoderLevel(zstd.SpeedFastest),
-		zstd.WithWindowSize(len(b)), // Window size = content size for single-frame compression
-	)
-	if err != nil {
-		return n, fmt.Errorf("cannot create zstd writer: %w", err)
-	}
-
-	// Write the page data and close to create a complete zstd frame.
-	if _, err = zw.Write(b); err != nil {
-		zw.Close()
+	// Write to the compressed writer to the buffer and then write the buffer to the uncompressed writer.
+	// This is necessary so we can calculate the size of the compressed data for the page index.
+	if _, err = enc.zw.Write(b); err != nil {
 		return n, err
 	}
 
-	// Close the writer to finalize the frame.
-	if err := zw.Close(); err != nil {
+	// Close the compressed writer to flush any remaining data.
+	if err := enc.zw.Close(); err != nil {
 		return n, fmt.Errorf("cannot close zstd writer: %w", err)
 	}
 

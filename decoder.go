@@ -13,8 +13,7 @@ import (
 
 // Decoder represents a decoder of an LTX file.
 type Decoder struct {
-	r  io.Reader      // main reader
-	zr *zstd.Decoder  // zstd reader
+	r io.Reader // main reader
 
 	header    Header
 	trailer   Trailer
@@ -29,14 +28,8 @@ type Decoder struct {
 
 // NewDecoder returns a new instance of Decoder.
 func NewDecoder(r io.Reader) *Decoder {
-	zr, err := zstd.NewReader(nil, zstd.WithDecoderLowmem(true), zstd.WithDecoderConcurrency(1))
-	if err != nil {
-		// This should not happen as NewReader only fails with invalid options
-		panic(fmt.Sprintf("failed to create zstd reader: %v", err))
-	}
 	return &Decoder{
 		r:     r,
-		zr:    zr,
 		state: stateHeader,
 		hash:  crc64.New(crc64.MakeTable(crc64.ISO)),
 	}
@@ -178,17 +171,21 @@ func (dec *Decoder) DecodePage(hdr *PageHeader, data []byte) error {
 	}
 
 	// Read page data next.
-	// Each page is compressed as an independent zstd frame.
-	// Reset the decoder to decompress the next frame from dec.r
-	if err := dec.zr.Reset(dec.r); err != nil {
-		return fmt.Errorf("reset zstd decoder: %w", err)
+	// TODO(zstd): The klauspost/compress/zstd library creates internal buffered readers
+	// that read ahead beyond frame boundaries. This causes issues when streaming multiple
+	// independent frames. Potential solutions:
+	// 1. Use page index for random access instead of streaming
+	// 2. Pre-read compressed frames based on page index sizes
+	// 3. Implement custom io.Reader wrapper to track/limit bytes consumed
+	zr, err := zstd.NewReader(dec.r)
+	if err != nil {
+		return fmt.Errorf("create zstd reader: %w", err)
 	}
+	defer zr.Close()
 
-	// Read exactly one page worth of decompressed data
-	if _, err := io.ReadFull(dec.zr, data); err != nil {
-		return fmt.Errorf("decompress page data: %w", err)
+	if _, err := io.ReadFull(zr, data); err != nil {
+		return err
 	}
-
 	dec.writeToHash(data)
 	dec.pageN++
 
