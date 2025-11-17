@@ -29,7 +29,7 @@ type Decoder struct {
 
 // NewDecoder returns a new instance of Decoder.
 func NewDecoder(r io.Reader) *Decoder {
-	zr, err := zstd.NewReader(r)
+	zr, err := zstd.NewReader(nil, zstd.WithDecoderLowmem(true), zstd.WithDecoderConcurrency(1))
 	if err != nil {
 		// This should not happen as NewReader only fails with invalid options
 		panic(fmt.Sprintf("failed to create zstd reader: %v", err))
@@ -178,17 +178,19 @@ func (dec *Decoder) DecodePage(hdr *PageHeader, data []byte) error {
 	}
 
 	// Read page data next.
-	dec.zr.Reset(dec.r)
-	if _, err := io.ReadFull(dec.zr, data); err != nil {
-		return err
+	// Each page is compressed as an independent zstd frame.
+	// Reset the decoder to decompress the next frame from dec.r
+	if err := dec.zr.Reset(dec.r); err != nil {
+		return fmt.Errorf("reset zstd decoder: %w", err)
 	}
+
+	// Read exactly one page worth of decompressed data
+	if _, err := io.ReadFull(dec.zr, data); err != nil {
+		return fmt.Errorf("decompress page data: %w", err)
+	}
+
 	dec.writeToHash(data)
 	dec.pageN++
-
-	// Read off the Zstd trailer frame to ensure we hit EOF.
-	if err := dec.readZstdTrailer(); err != nil {
-		return fmt.Errorf("read zstd trailer: %w", err)
-	}
 
 	// Calculate checksum while decoding snapshots if tracking checksums.
 	if dec.header.IsSnapshot() && !dec.header.NoChecksum() {
@@ -277,13 +279,6 @@ func (dec *Decoder) writeToHash(b []byte) {
 	dec.n += int64(len(b))
 }
 
-// readZstdTrailer reads the Zstd trailer frame to ensure we hit EOF.
-func (dec *Decoder) readZstdTrailer() error {
-	if _, err := io.ReadFull(dec.zr, make([]byte, 1)); err != io.EOF {
-		return fmt.Errorf("expected zstd end frame")
-	}
-	return nil
-}
 
 // DecodeHeader decodes the header from r. Returns the header & read bytes.
 func DecodeHeader(r io.Reader) (hdr Header, data []byte, err error) {
