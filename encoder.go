@@ -9,13 +9,13 @@ import (
 	"io"
 	"slices"
 
-	"github.com/pierrec/lz4/v4"
+	"github.com/klauspost/compress/zstd"
 )
 
 // Encoder implements an encoder for an LTX file.
 type Encoder struct {
-	w     io.Writer   // main writer
-	zw    *lz4.Writer // compressed writer
+	w     io.Writer      // main writer
+	zw    *zstd.Encoder  // compressed writer
 	state string
 
 	header  Header
@@ -40,12 +40,9 @@ func NewEncoder(w io.Writer) (*Encoder, error) {
 
 	// The compressed writer writes to a buffer so we can calculate the size
 	// of the compressed data for the page index.
-	zw := lz4.NewWriter(&enc.buf)
-	if err := zw.Apply(lz4.BlockSizeOption(lz4.Block64Kb)); err != nil { // minimize memory allocation
-		return nil, fmt.Errorf("cannot set lz4 block size: %w", err)
-	}
-	if err := zw.Apply(lz4.CompressionLevelOption(lz4.Fast)); err != nil {
-		return nil, fmt.Errorf("cannot set lz4 compression level: %w", err)
+	zw, err := zstd.NewWriter(&enc.buf, zstd.WithEncoderLevel(zstd.SpeedDefault))
+	if err != nil {
+		return nil, fmt.Errorf("cannot create zstd writer: %w", err)
 	}
 	enc.zw = zw
 
@@ -94,7 +91,7 @@ func (enc *Encoder) Close() error {
 
 	// Close the compressed writer.
 	if err := enc.zw.Close(); err != nil {
-		return fmt.Errorf("cannot close lz4 writer: %w", err)
+		return fmt.Errorf("cannot close zstd writer: %w", err)
 	}
 
 	// Write index to file.
@@ -288,7 +285,7 @@ func (enc *Encoder) writeCompressed(b []byte) (n int, err error) {
 
 	// Close the compressed writer to flush any remaining data.
 	if err := enc.zw.Close(); err != nil {
-		return n, fmt.Errorf("cannot close lz4 writer: %w", err)
+		return n, fmt.Errorf("cannot close zstd writer: %w", err)
 	}
 
 	compressed := enc.buf.Bytes()

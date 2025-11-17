@@ -8,13 +8,13 @@ import (
 	"hash/crc64"
 	"io"
 
-	"github.com/pierrec/lz4/v4"
+	"github.com/klauspost/compress/zstd"
 )
 
 // Decoder represents a decoder of an LTX file.
 type Decoder struct {
-	r  io.Reader   // main reader
-	zr *lz4.Reader // lz4 reader
+	r  io.Reader      // main reader
+	zr *zstd.Decoder  // zstd reader
 
 	header    Header
 	trailer   Trailer
@@ -29,9 +29,14 @@ type Decoder struct {
 
 // NewDecoder returns a new instance of Decoder.
 func NewDecoder(r io.Reader) *Decoder {
+	zr, err := zstd.NewReader(r)
+	if err != nil {
+		// This should not happen as NewReader only fails with invalid options
+		panic(fmt.Sprintf("failed to create zstd reader: %v", err))
+	}
 	return &Decoder{
 		r:     r,
-		zr:    lz4.NewReader(r),
+		zr:    zr,
 		state: stateHeader,
 		hash:  crc64.New(crc64.MakeTable(crc64.ISO)),
 	}
@@ -180,9 +185,9 @@ func (dec *Decoder) DecodePage(hdr *PageHeader, data []byte) error {
 	dec.writeToHash(data)
 	dec.pageN++
 
-	// Read off the LZ4 trailer frame to ensure we hit EOF.
-	if err := dec.readLZ4Trailer(); err != nil {
-		return fmt.Errorf("read lz4 trailer: %w", err)
+	// Read off the Zstd trailer frame to ensure we hit EOF.
+	if err := dec.readZstdTrailer(); err != nil {
+		return fmt.Errorf("read zstd trailer: %w", err)
 	}
 
 	// Calculate checksum while decoding snapshots if tracking checksums.
@@ -272,10 +277,10 @@ func (dec *Decoder) writeToHash(b []byte) {
 	dec.n += int64(len(b))
 }
 
-// readLZ4Trailer reads the LZ4 trailer frame to ensure we hit EOF.
-func (dec *Decoder) readLZ4Trailer() error {
+// readZstdTrailer reads the Zstd trailer frame to ensure we hit EOF.
+func (dec *Decoder) readZstdTrailer() error {
 	if _, err := io.ReadFull(dec.zr, make([]byte, 1)); err != io.EOF {
-		return fmt.Errorf("expected lz4 end frame")
+		return fmt.Errorf("expected zstd end frame")
 	}
 	return nil
 }
@@ -301,7 +306,11 @@ func DecodePageData(b []byte) (hdr PageHeader, data []byte, err error) {
 		return hdr, data, nil
 	}
 
-	zr := lz4.NewReader(bytes.NewReader(b[PageHeaderSize:]))
+	zr, err := zstd.NewReader(bytes.NewReader(b[PageHeaderSize:]))
+	if err != nil {
+		return hdr, data, fmt.Errorf("create zstd reader: %w", err)
+	}
+	defer zr.Close()
 	data, err = io.ReadAll(zr)
 	return hdr, data, err
 }

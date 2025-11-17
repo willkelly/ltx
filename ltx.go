@@ -20,7 +20,7 @@ const (
 	Magic = "LTX1"
 
 	// Version is the current version of the LTX file format.
-	Version = 3
+	Version = 4
 )
 
 // Size constants.
