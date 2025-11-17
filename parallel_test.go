@@ -58,7 +58,7 @@ func BenchmarkParallelDecodeFile(b *testing.B) {
 	f.Close()
 
 	// Benchmark different worker counts
-	for _, workers := range []int{1, 2, 4, 8, 16} {
+	for _, workers := range []int{1, 2, 4, 8, 16, 32, 64} {
 		b.Run(fmt.Sprintf("Workers%d", workers), func(b *testing.B) {
 			b.SetBytes(int64(pageN * pageSize))
 			b.ReportAllocs()
@@ -122,7 +122,7 @@ func BenchmarkSeekableDecoderAll(b *testing.B) {
 	f.Close()
 
 	// Benchmark different worker counts
-	for _, workers := range []int{1, 2, 4, 8, 16} {
+	for _, workers := range []int{1, 2, 4, 8, 16, 32, 64} {
 		b.Run(fmt.Sprintf("Workers%d", workers), func(b *testing.B) {
 			b.SetBytes(int64(pageN * pageSize))
 			b.ReportAllocs()

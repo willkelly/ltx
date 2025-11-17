@@ -8,6 +8,7 @@ import (
 	"hash/crc64"
 	"io"
 	"os"
+	"runtime"
 	"sort"
 	"sync"
 
@@ -416,9 +417,16 @@ func DecodePageData(b []byte) (hdr PageHeader, data []byte, err error) {
 // ParallelDecodeFile decodes all pages from an LTX file in parallel using the file path.
 // Uses file seeks for random access - suitable for very large files without loading into memory.
 // Returns a map of page number to page data.
+// If workers <= 0, defaults to runtime.NumCPU()/2, capped at 64.
 func ParallelDecodeFile(filename string, workers int) (Header, map[uint32][]byte, error) {
 	if workers <= 0 {
-		workers = 2 // default
+		workers = runtime.NumCPU() / 2
+		if workers < 1 {
+			workers = 1
+		}
+		if workers > 64 {
+			workers = 64
+		}
 	}
 
 	// Open file for reading
@@ -587,10 +595,17 @@ type SeekableDecoder struct {
 }
 
 // NewSeekableDecoder creates a new seekable decoder for the given LTX file.
-// workers specifies the number of parallel decompression workers (default: 4 if workers <= 0).
+// workers specifies the number of parallel decompression workers.
+// If workers <= 0, defaults to runtime.NumCPU()/2, capped at 64.
 func NewSeekableDecoder(filename string, workers int) (*SeekableDecoder, error) {
 	if workers <= 0 {
-		workers = 4 // default
+		workers = runtime.NumCPU() / 2
+		if workers < 1 {
+			workers = 1
+		}
+		if workers > 64 {
+			workers = 64
+		}
 	}
 
 	// Open file
