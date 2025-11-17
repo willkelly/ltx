@@ -7,9 +7,18 @@ import (
 	"hash"
 	"hash/crc64"
 	"io"
+	"os"
+	"sort"
+	"sync"
 
 	"github.com/pierrec/lz4/v4"
 )
+
+// checksumJob represents a page to checksum.
+type checksumJob struct {
+	pgno uint32
+	data []byte
+}
 
 // Decoder represents a decoder of an LTX file.
 type Decoder struct {
@@ -21,19 +30,97 @@ type Decoder struct {
 	pageIndex map[uint32]PageIndexElem
 	state     string
 
-	chksum Checksum
-	hash   hash.Hash64
-	pageN  int   // pages read
-	n      int64 // bytes read
+	chksum     Checksum
+	hash       hash.Hash64 // file checksum hasher
+	pageHasher hash.Hash64 // reusable hasher for per-page checksums (not used when parallel)
+	pageN      int         // pages read
+	n          int64       // bytes read
+
+	// Parallel checksumming
+	checksumWorkers        int
+	checksumJobs           chan checksumJob
+	checksumWg             sync.WaitGroup
+	checksumWorkerResults  []Checksum     // per-worker XOR accumulators
+	bufferPool             *sync.Pool     // pool of page buffers to avoid copying
 }
 
 // NewDecoder returns a new instance of Decoder.
 func NewDecoder(r io.Reader) *Decoder {
 	return &Decoder{
-		r:     r,
-		zr:    lz4.NewReader(r),
-		state: stateHeader,
-		hash:  crc64.New(crc64.MakeTable(crc64.ISO)),
+		r:          r,
+		zr:         lz4.NewReader(r),
+		state:      stateHeader,
+		hash:       crc64.New(crc64.MakeTable(crc64.ISO)),
+		pageHasher: NewHasher(),
+	}
+}
+
+// SetChecksumWorkers sets the number of parallel workers for checksum computation.
+// If workers > 1, checksums will be computed in parallel.
+// Must be called before DecodeHeader(). Default is 0 (sequential).
+func (dec *Decoder) SetChecksumWorkers(workers int) {
+	if workers < 0 {
+		workers = 0
+	}
+	dec.checksumWorkers = workers
+}
+
+// startChecksumWorkers initializes the worker pool for parallel checksumming.
+func (dec *Decoder) startChecksumWorkers() {
+	if dec.checksumWorkers <= 0 {
+		return // Sequential mode
+	}
+
+	dec.checksumJobs = make(chan checksumJob, dec.checksumWorkers*2)
+	dec.checksumWorkerResults = make([]Checksum, dec.checksumWorkers)
+
+	// Create buffer pool to avoid allocating new buffers for each page
+	pageSize := int(dec.header.PageSize)
+	dec.bufferPool = &sync.Pool{
+		New: func() interface{} {
+			buf := make([]byte, pageSize)
+			return &buf
+		},
+	}
+
+	for i := 0; i < dec.checksumWorkers; i++ {
+		dec.checksumWg.Add(1)
+		go dec.checksumWorker(i)
+	}
+}
+
+// checksumWorker processes checksum jobs from the queue.
+// Each worker maintains its own local XOR accumulator to avoid contention.
+func (dec *Decoder) checksumWorker(workerID int) {
+	defer dec.checksumWg.Done()
+
+	hasher := NewHasher()
+	localChecksum := Checksum(0)
+
+	for job := range dec.checksumJobs {
+		chksum := ChecksumPageWithHasher(hasher, job.pgno, job.data)
+		localChecksum ^= chksum
+
+		// Return buffer to pool
+		dec.bufferPool.Put(&job.data)
+	}
+
+	// Store worker's accumulated checksum
+	dec.checksumWorkerResults[workerID] = localChecksum
+}
+
+// stopChecksumWorkers waits for all workers to finish and combines their results.
+func (dec *Decoder) stopChecksumWorkers() {
+	if dec.checksumWorkers <= 0 {
+		return
+	}
+
+	close(dec.checksumJobs)
+	dec.checksumWg.Wait()
+
+	// Combine all worker checksums (no synchronization needed, workers are done)
+	for _, workerChecksum := range dec.checksumWorkerResults {
+		dec.chksum = ChecksumFlag | (dec.chksum ^ workerChecksum)
 	}
 }
 
@@ -71,6 +158,9 @@ func (dec *Decoder) Close() error {
 	} else if dec.state != stateClose {
 		return fmt.Errorf("cannot close, expected %s", dec.state)
 	}
+
+	// Wait for all checksum workers to finish if parallel mode
+	dec.stopChecksumWorkers()
 
 	// Slurp the remaining data in to memory so we can use the ByteReader interface.
 	remainingBytes, err := io.ReadAll(dec.r)
@@ -135,6 +225,11 @@ func (dec *Decoder) DecodeHeader() error {
 	// Initialize checksum if checksum tracking is enabled.
 	if !dec.header.NoChecksum() {
 		dec.chksum = ChecksumFlag
+
+		// Start parallel checksum workers if configured
+		if dec.header.IsSnapshot() {
+			dec.startChecksumWorkers()
+		}
 	}
 
 	return nil
@@ -188,7 +283,19 @@ func (dec *Decoder) DecodePage(hdr *PageHeader, data []byte) error {
 	// Calculate checksum while decoding snapshots if tracking checksums.
 	if dec.header.IsSnapshot() && !dec.header.NoChecksum() {
 		if hdr.Pgno != LockPgno(dec.header.PageSize) {
-			dec.chksum = ChecksumFlag | (dec.chksum ^ ChecksumPage(hdr.Pgno, data))
+			if dec.checksumWorkers > 0 {
+				// Parallel mode: get buffer from pool, copy data, and send to worker
+				bufPtr := dec.bufferPool.Get().(*[]byte)
+				dataCopy := *bufPtr
+				copy(dataCopy, data)
+				dec.checksumJobs <- checksumJob{
+					pgno: hdr.Pgno,
+					data: dataCopy,
+				}
+			} else {
+				// Sequential mode: compute checksum inline
+				dec.chksum = ChecksumFlag | (dec.chksum ^ ChecksumPageWithHasher(dec.pageHasher, hdr.Pgno, data))
+			}
 		}
 	}
 
@@ -306,6 +413,125 @@ func DecodePageData(b []byte) (hdr PageHeader, data []byte, err error) {
 	return hdr, data, err
 }
 
+// ParallelDecodeFile decodes all pages from an LTX file in parallel using the file path.
+// Uses file seeks for random access - suitable for very large files without loading into memory.
+// Returns a map of page number to page data.
+func ParallelDecodeFile(filename string, workers int) (Header, map[uint32][]byte, error) {
+	if workers <= 0 {
+		workers = 2 // default
+	}
+
+	// Open file for reading
+	f, err := os.Open(filename)
+	if err != nil {
+		return Header{}, nil, err
+	}
+	defer f.Close()
+
+	// Get file size
+	stat, err := f.Stat()
+	if err != nil {
+		return Header{}, nil, err
+	}
+	fileSize := stat.Size()
+
+	// Decode header
+	headerBuf := make([]byte, HeaderSize)
+	if _, err := f.ReadAt(headerBuf, 0); err != nil {
+		return Header{}, nil, err
+	}
+	hdr, _, err := DecodeHeader(bytes.NewReader(headerBuf))
+	if err != nil {
+		return Header{}, nil, fmt.Errorf("decode header: %w", err)
+	}
+
+	// Read the 8-byte index size field (located before the trailer)
+	indexSizeOffset := fileSize - TrailerSize - 8
+	indexSizeBuf := make([]byte, 8)
+	if _, err := f.ReadAt(indexSizeBuf, indexSizeOffset); err != nil {
+		return Header{}, nil, fmt.Errorf("read index size: %w", err)
+	}
+
+	// The size includes everything written by encodePageIndex EXCEPT the 8-byte size itself
+	indexDataSize := int64(binary.BigEndian.Uint64(indexSizeBuf))
+
+	// Calculate where the index data starts
+	indexDataStart := indexSizeOffset - indexDataSize
+
+	// Read index data + size field (DecodePageIndex expects both)
+	indexBufSize := indexDataSize + 8
+	indexBuf := make([]byte, indexBufSize)
+	if _, err := f.ReadAt(indexBuf, indexDataStart); err != nil {
+		return Header{}, nil, fmt.Errorf("read index: %w", err)
+	}
+
+	// Decode the index
+	pageIndex, err := DecodePageIndex(bytes.NewReader(indexBuf), 0, hdr.MinTXID, hdr.MaxTXID)
+	if err != nil {
+		return Header{}, nil, fmt.Errorf("decode page index: %w", err)
+	}
+
+	// Create result map and job channel
+	pages := make(map[uint32][]byte)
+	var pagesMu sync.Mutex
+
+	type decodeJob struct {
+		pgno   uint32
+		offset int64
+		size   int64
+	}
+	jobs := make(chan decodeJob, len(pageIndex))
+
+	// Start worker pool - each worker opens its own file handle
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			// Each worker gets its own file handle for concurrent reads
+			workerFile, err := os.Open(filename)
+			if err != nil {
+				return
+			}
+			defer workerFile.Close()
+
+			for job := range jobs {
+				// Read page data at offset
+				pageData := make([]byte, job.size)
+				if _, err := workerFile.ReadAt(pageData, job.offset); err != nil {
+					continue
+				}
+
+				// Decode page
+				_, data, err := DecodePageData(pageData)
+				if err != nil {
+					continue
+				}
+
+				pagesMu.Lock()
+				pages[job.pgno] = data
+				pagesMu.Unlock()
+			}
+		}()
+	}
+
+	// Send jobs
+	for pgno, elem := range pageIndex {
+		jobs <- decodeJob{
+			pgno:   pgno,
+			offset: elem.Offset,
+			size:   elem.Size,
+		}
+	}
+	close(jobs)
+
+	// Wait for completion
+	wg.Wait()
+
+	return hdr, pages, nil
+}
+
 // DecodePageIndex decodes the page index from r.
 func DecodePageIndex(r io.ByteReader, level int, minTXID, maxTXID TXID) (map[uint32]PageIndexElem, error) {
 	pageIndex := make(map[uint32]PageIndexElem)
@@ -343,4 +569,291 @@ func DecodePageIndex(r io.ByteReader, level int, minTXID, maxTXID TXID) (map[uin
 	}
 
 	return pageIndex, nil
+}
+
+// SeekableDecoder provides on-demand page decoding from an LTX file.
+// Unlike ParallelDecodeFile which loads all pages into memory, SeekableDecoder
+// allows decoding individual pages or batches as needed, minimizing memory usage.
+// It uses parallel workers for concurrent page decompression when multiple pages are requested.
+type SeekableDecoder struct {
+	f       *os.File
+	header  Header
+	trailer Trailer
+	index   map[uint32]PageIndexElem
+	workers int
+
+	// Buffer pool for efficient memory reuse
+	bufferPool *sync.Pool
+}
+
+// NewSeekableDecoder creates a new seekable decoder for the given LTX file.
+// workers specifies the number of parallel decompression workers (default: 4 if workers <= 0).
+func NewSeekableDecoder(filename string, workers int) (*SeekableDecoder, error) {
+	if workers <= 0 {
+		workers = 4 // default
+	}
+
+	// Open file
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get file size
+	stat, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	fileSize := stat.Size()
+
+	// Read header
+	headerBuf := make([]byte, HeaderSize)
+	if _, err := f.ReadAt(headerBuf, 0); err != nil {
+		f.Close()
+		return nil, err
+	}
+	hdr, _, err := DecodeHeader(bytes.NewReader(headerBuf))
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("decode header: %w", err)
+	}
+
+	// Read trailer
+	trailerBuf := make([]byte, TrailerSize)
+	if _, err := f.ReadAt(trailerBuf, fileSize-TrailerSize); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("read trailer: %w", err)
+	}
+	var trailer Trailer
+	if err := trailer.UnmarshalBinary(trailerBuf); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("unmarshal trailer: %w", err)
+	}
+
+	// Read page index from end of file
+	indexSizeOffset := fileSize - TrailerSize - 8
+	indexSizeBuf := make([]byte, 8)
+	if _, err := f.ReadAt(indexSizeBuf, indexSizeOffset); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("read index size: %w", err)
+	}
+
+	indexDataSize := int64(binary.BigEndian.Uint64(indexSizeBuf))
+	indexDataStart := indexSizeOffset - indexDataSize
+	indexBufSize := indexDataSize + 8
+	indexBuf := make([]byte, indexBufSize)
+	if _, err := f.ReadAt(indexBuf, indexDataStart); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("read index: %w", err)
+	}
+
+	pageIndex, err := DecodePageIndex(bytes.NewReader(indexBuf), 0, hdr.MinTXID, hdr.MaxTXID)
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("decode page index: %w", err)
+	}
+
+	sd := &SeekableDecoder{
+		f:       f,
+		header:  hdr,
+		trailer: trailer,
+		index:   pageIndex,
+		workers: workers,
+	}
+
+	// Initialize buffer pool for page data
+	sd.bufferPool = &sync.Pool{
+		New: func() interface{} {
+			return new([]byte)
+		},
+	}
+
+	return sd, nil
+}
+
+// Header returns a copy of the file header.
+func (sd *SeekableDecoder) Header() Header { return sd.header }
+
+// Trailer returns a copy of the file trailer.
+func (sd *SeekableDecoder) Trailer() Trailer { return sd.trailer }
+
+// PageIndex returns the page index mapping page numbers to file offsets.
+func (sd *SeekableDecoder) PageIndex() map[uint32]PageIndexElem { return sd.index }
+
+// Close closes the underlying file.
+func (sd *SeekableDecoder) Close() error {
+	if sd.f != nil {
+		return sd.f.Close()
+	}
+	return nil
+}
+
+// DecodePage decodes a single page by page number.
+// Returns an error if the page is not in the index.
+func (sd *SeekableDecoder) DecodePage(pgno uint32) ([]byte, error) {
+	elem, ok := sd.index[pgno]
+	if !ok {
+		return nil, fmt.Errorf("page %d not found in index", pgno)
+	}
+
+	// Read page data at offset
+	pageData := make([]byte, elem.Size)
+	if _, err := sd.f.ReadAt(pageData, elem.Offset); err != nil {
+		return nil, fmt.Errorf("read page %d: %w", pgno, err)
+	}
+
+	// Decode page
+	_, data, err := DecodePageData(pageData)
+	if err != nil {
+		return nil, fmt.Errorf("decode page %d: %w", pgno, err)
+	}
+
+	return data, nil
+}
+
+// DecodePages decodes multiple pages in parallel.
+// Pages not found in the index are skipped (not included in result map).
+func (sd *SeekableDecoder) DecodePages(pgnos []uint32) (map[uint32][]byte, error) {
+	if len(pgnos) == 0 {
+		return make(map[uint32][]byte), nil
+	}
+
+	// Result map
+	pages := make(map[uint32][]byte, len(pgnos))
+	var pagesMu sync.Mutex
+	var resultErr error
+	var errMu sync.Mutex
+
+	// Create job channel
+	type decodeJob struct {
+		pgno   uint32
+		offset int64
+		size   int64
+	}
+	jobs := make(chan decodeJob, len(pgnos))
+
+	// Start workers
+	var wg sync.WaitGroup
+	for i := 0; i < sd.workers && i < len(pgnos); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			// Each worker opens its own file handle for concurrent reads
+			workerFile, err := os.Open(sd.f.Name())
+			if err != nil {
+				errMu.Lock()
+				if resultErr == nil {
+					resultErr = err
+				}
+				errMu.Unlock()
+				return
+			}
+			defer workerFile.Close()
+
+			for job := range jobs {
+				// Read page data at offset
+				pageData := make([]byte, job.size)
+				if _, err := workerFile.ReadAt(pageData, job.offset); err != nil {
+					errMu.Lock()
+					if resultErr == nil {
+						resultErr = fmt.Errorf("read page %d: %w", job.pgno, err)
+					}
+					errMu.Unlock()
+					continue
+				}
+
+				// Decode page
+				_, data, err := DecodePageData(pageData)
+				if err != nil {
+					errMu.Lock()
+					if resultErr == nil {
+						resultErr = fmt.Errorf("decode page %d: %w", job.pgno, err)
+					}
+					errMu.Unlock()
+					continue
+				}
+
+				pagesMu.Lock()
+				pages[job.pgno] = data
+				pagesMu.Unlock()
+			}
+		}()
+	}
+
+	// Send jobs for pages that exist in the index
+	for _, pgno := range pgnos {
+		if elem, ok := sd.index[pgno]; ok {
+			jobs <- decodeJob{
+				pgno:   pgno,
+				offset: elem.Offset,
+				size:   elem.Size,
+			}
+		}
+	}
+	close(jobs)
+
+	// Wait for completion
+	wg.Wait()
+
+	return pages, resultErr
+}
+
+// DecodeAllPages decodes all pages in the index in parallel.
+// WARNING: Peak memory usage is unbounded and scales with file size.
+// Typically requires 2x+ the size of the database (e.g., 200MB peak for 100MB file).
+// For large files, use DecodeInBatches() instead to limit memory usage.
+func (sd *SeekableDecoder) DecodeAllPages() (map[uint32][]byte, error) {
+	pgnos := make([]uint32, 0, len(sd.index))
+	for pgno := range sd.index {
+		pgnos = append(pgnos, pgno)
+	}
+	return sd.DecodePages(pgnos)
+}
+
+// DecodeInBatches decodes all pages in batches, calling fn for each batch.
+// This allows processing large files without keeping all pages in memory.
+// Default batch size is 800 pages (~25MB for 32KB pages).
+// Returns on first error from fn or decoding error.
+func (sd *SeekableDecoder) DecodeInBatches(fn func(pages map[uint32][]byte) error) error {
+	return sd.DecodeInBatchesWithSize(800, fn)
+}
+
+// DecodeInBatchesWithSize decodes all pages in batches of the specified size.
+// Calls fn for each batch, allowing processing without keeping all pages in memory.
+func (sd *SeekableDecoder) DecodeInBatchesWithSize(batchSize int, fn func(pages map[uint32][]byte) error) error {
+	if batchSize <= 0 {
+		batchSize = 800
+	}
+
+	// Get all page numbers and sort them
+	pgnos := make([]uint32, 0, len(sd.index))
+	for pgno := range sd.index {
+		pgnos = append(pgnos, pgno)
+	}
+
+	// Sort for sequential processing
+	type uint32Slice []uint32
+	sort.Slice(pgnos, func(i, j int) bool { return pgnos[i] < pgnos[j] })
+
+	// Process in batches
+	for i := 0; i < len(pgnos); i += batchSize {
+		end := i + batchSize
+		if end > len(pgnos) {
+			end = len(pgnos)
+		}
+
+		batch := pgnos[i:end]
+		pages, err := sd.DecodePages(batch)
+		if err != nil {
+			return err
+		}
+
+		if err := fn(pages); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

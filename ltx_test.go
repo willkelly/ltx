@@ -748,6 +748,135 @@ func BenchmarkXOR(b *testing.B) {
 	}
 }
 
+// BenchmarkEncodeLargeFile benchmarks encoding a large file with 32KB pages.
+// This simulates encoding a 100MB database with 32KB pages (3200 pages).
+func BenchmarkEncodeLargeFile(b *testing.B) {
+	const pageSize = 32768
+	const pageN = 3200 // 100MB / 32KB
+
+	// Generate random page data once to reuse across iterations
+	pages := make([][]byte, pageN)
+	for i := range pages {
+		pages[i] = make([]byte, pageSize)
+		_, _ = rand.Read(pages[i])
+	}
+
+	b.SetBytes(int64(pageN * pageSize))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		enc, err := ltx.NewEncoder(io.Discard)
+		if err != nil {
+			b.Fatal(err)
+		}
+
+		if err := enc.EncodeHeader(ltx.Header{
+			Version:  ltx.Version,
+			PageSize: pageSize,
+			Commit:   pageN,
+			MinTXID:  1,
+			MaxTXID:  1,
+		}); err != nil {
+			b.Fatal(err)
+		}
+
+		for pgno := uint32(1); pgno <= pageN; pgno++ {
+			if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, pages[pgno-1]); err != nil {
+				b.Fatal(err)
+			}
+		}
+
+		enc.SetPostApplyChecksum(ltx.ChecksumFlag | 1)
+		if err := enc.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkDecodeLargeFile benchmarks decoding a large file with 32KB pages.
+// This simulates decoding a 100MB database with 32KB pages (3200 pages).
+func BenchmarkDecodeLargeFile(b *testing.B) {
+	benchmarkDecodeLargeFile(b, 0) // Sequential
+}
+
+// BenchmarkDecodeLargeFileParallel benchmarks parallel decoding with checksum workers.
+func BenchmarkDecodeLargeFileParallel(b *testing.B) {
+	for _, workers := range []int{1, 2, 3, 4, 8, 16} {
+		b.Run(fmt.Sprintf("Workers%d", workers), func(b *testing.B) {
+			benchmarkDecodeLargeFile(b, workers)
+		})
+	}
+}
+
+func benchmarkDecodeLargeFile(b *testing.B, workers int) {
+	const pageSize = 32768
+	const pageN = 3200 // 100MB / 32KB
+
+	// Generate a file once to decode repeatedly
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	if err := enc.EncodeHeader(ltx.Header{
+		Version:  ltx.Version,
+		PageSize: pageSize,
+		Commit:   pageN,
+		MinTXID:  1,
+		MaxTXID:  1,
+	}); err != nil {
+		b.Fatal(err)
+	}
+
+	// Calculate checksum while encoding pages
+	var dbChecksum ltx.Checksum
+	page := make([]byte, pageSize)
+	for pgno := uint32(1); pgno <= pageN; pgno++ {
+		_, _ = rand.Read(page)
+		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, page); err != nil {
+			b.Fatal(err)
+		}
+		dbChecksum ^= ltx.ChecksumPage(pgno, page)
+	}
+
+	enc.SetPostApplyChecksum(ltx.ChecksumFlag | dbChecksum)
+	if err := enc.Close(); err != nil {
+		b.Fatal(err)
+	}
+
+	encodedData := buf.Bytes()
+	b.SetBytes(int64(pageN * pageSize))
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		dec := ltx.NewDecoder(bytes.NewReader(encodedData))
+		if workers > 0 {
+			dec.SetChecksumWorkers(workers)
+		}
+
+		if err := dec.DecodeHeader(); err != nil {
+			b.Fatal(err)
+		}
+
+		pageData := make([]byte, pageSize)
+		for {
+			var hdr ltx.PageHeader
+			if err := dec.DecodePage(&hdr, pageData); err == io.EOF {
+				break
+			} else if err != nil {
+				b.Fatal(err)
+			}
+		}
+
+		if err := dec.Close(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // createFile creates a file and returns the file handle. Closes on cleanup.
 func createFile(tb testing.TB, name string) *os.File {
 	tb.Helper()
